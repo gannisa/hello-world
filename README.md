@@ -1,4 +1,4 @@
-# sample-lambda
+# Hello-world
 
 ## Create a stack
 aws cloudformation deploy --template-file lambda-function.yaml --stack-name sample-function --capabilities CAPABILITY_IAM
