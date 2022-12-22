@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  KeyPair:
+    Description: Keypair
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: "nginx-test"
+  LinuxAMI:
+    Description: Amazon Linux AMI ID
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  VpcBlock:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: CIDR range for the VPC. This should be a valid private (RFC 1918) CIDR range.
+  PublicSubnetBlock1:
+    Type: String
+    Default: 10.10.50.0/24
+    Description: CIDR range for Public Subnet
+  PublicSubnetBlock2:
+    Type: String
+    Default: 10.10.100.0/24
+    Description: CIDR range for Public Subnet
+  YourIPRange:
+    Type: String
+    Description: CIDR range of the network from where you will SSH to the Master server
+    MinLength: "9"
+    MaxLength: "18"
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x
+    Default: "0.0.0.0/0"
+  S3Bucket:
+    Type: String
+    Default: python-hello
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+  VPCGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Subnets
+        - Key: Network
+          Value: Public
+  PublicRoute:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - "0"
+          - Fn::GetAZs: !Ref AWS::Region
+      CidrBlock: !Ref PublicSubnetBlock1
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet1"
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - "1"
+          - Fn::GetAZs: !Ref AWS::Region
+      CidrBlock: !Ref PublicSubnetBlock2
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet2"
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  
+  HelloAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LinuxAMI
+      SecurityGroups:
+        - !Ref HelloAppSecGroup
+      KeyName: !Ref KeyPair
+      IamInstanceProfile: !Ref AppInstanceProfile
+      UserData: !Base64 
+        'Fn::Sub':
+          - >
+            #!/bin/bash -x
+
+            # Install the files and packages from the metadata
+
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource HelloAppLaunchConfig 
+            --configsets InstallAndRun --region ${AWS::Region}
+
+
+            # Signal the status from cfn-init
+
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource
+            HelloAppLaunchConfig --configsets InstallAndRun --region ${AWS::Region}
+          - {}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallAndRun:
+            - "Configure"
+        Configure:
+          packages:
+            yum:
+              python3: []
+              python3-pip: []
+          files:
+            /opt/helloworld.py:
+              owner: root
+              group: root
+              mode: 755
+              source: !Join ["", ["https://", !Ref S3Bucket, ".s3.", !Ref "AWS::Region", ".", !Ref "AWS::URLSuffix", "/hello-world.py" ]]
+              authentification: "role"
+            /etc/systemd/system/helloworld.service:
+              owner: root
+              group: root
+              mode: 755
+              content: |
+                [Unit]
+                Description=HelloWorld service
+                After=network.target
+                [Service]
+                Type=simple
+                User=root
+                ExecStart=/opt/helloworld.py
+                Restart=on-abort
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            installflask:
+              # This commands runs installation
+              command: "pip3 install flask"
+              # This commands runs BEFORE command above
+              # and checks if pip3 is present on system
+              # if return code is not 0 cfn-init stops
+              test: "which pip3"
+            reloadsystemd:
+              command: "systemctl daemon-reload"
+          services:
+            sysvinit:
+              helloworld:
+                enabled: "true"
+                ensureRunning: "true"
+      AWS::CloudFormation::Authentication:
+        role:
+          type: "S3"
+          buckets:
+            - !Ref S3Bucket
+          roleName: !Ref AppRole
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Principal:
+              Service: "ec2.amazonaws.com"
+      Policies:
+        - PolicyName: S3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:*"
+                Resource: "*"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppRole
+
+  HelloAppSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App Sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !Ref ELBSecurityGroup
+          FromPort: 5000
+          ToPort: 5000
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+  
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Elb Security Group
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+  
+  HelloAppELB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+  ELBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref HelloAppELB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref TargetGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+
+  AutoScalingGroup:
+    DependsOn: ELBListener
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MaxSize: "1"
+      MinSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchConfigurationName: !Ref HelloAppLaunchConfig
+      TargetGroupARNs:
+        - !Ref TargetGroup
+  
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: "AllowSecretsManagerRead"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:Create*
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+  
+  CloudWatchServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref "CloudWatchAgentRole"
+  
+  WebServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  4xxMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        !Ref WebServerLogGroup
+      FilterPattern: "[ip, identity, user_id, timestamp, request, status_code = 4*, size, ...]"
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: test/4xxs
+          MetricName: test4xxCount
+
+  UnauthorizedApiMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+      LogGroupName: !Ref WebServerLogGroup
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: test/error
+          MetricName: UnauthorizedApiCallsMetric
+
+  BytesTransferredMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        !Ref WebServerLogGroup
+      FilterPattern: "[ip, identity, user_id, timestamp, request, status_code, size, ...]"
+      MetricTransformations:
+        - MetricValue: "$size"
+          MetricNamespace: test/BytesTransferred
+          MetricName: testBytesTransferred
+
+  4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The number of 4xxs is greater than 10 over a configurable time frame in minutes
+      MetricName: test4xxCount
+      Namespace: test/4xxs
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 10
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      ComparisonOperator: GreaterThanThreshold
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: CloudwatchMetricsAlaram
+      Subscription:
+        - Endpoint: "kamireddy777@gmail.com"
+          Protocol: email
+      Tags:
+        - Key: name
+          Value: WeserverMetrics
+
+  UnauthorizedApiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: True
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      AlarmDescription: Alarms on unauthorized API calls - CIS Benchmark 3.1
+      AlarmName: UnauthorizedApiCallsAlarm
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      MetricName: UnauthorizedApiCallsMetric
+      Namespace: test/error
+      Period: 300
+      Statistic: Sum
+      Threshold: 20
+      TreatMissingData: missing
+
+Outputs:
+  HelloAppELB:
+    Description: ELB 
+    Value: !Ref HelloAppELB
